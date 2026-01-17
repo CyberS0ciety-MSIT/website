@@ -3,9 +3,9 @@ name: SAST Scanning
 on:
   workflow_dispatch: {}
   pull_request:
-    branches: [v3_shubham, dev]
+    branches: [main, dev]
   push:
-    branches: [v3_shubham]
+    branches: [dev]
 
 jobs:
 
@@ -290,3 +290,4 @@ jobs:
     
                 core.setFailed("SAST vulnerabilities detected");
               }
+
