@@ -2,52 +2,12 @@ name: SAST Scanning
 
 on:
   workflow_dispatch: {}
-  push:
-    branches:
-      - dev
   pull_request:
-    branches:
-      - main
-      -  dev 
+    branches: [v3_shubham, dev]
+  push:
+    branches: [v3_shubham]
 
 jobs:
-
-    snyk:
-      name: Snyk Scan
-      runs-on: ubuntu-latest
-  
-      permissions:
-        security-events: write
-      # If your repository is private, also add:
-        actions: read
-        contents: read
-  
-      steps:
-        - uses: actions/checkout@master
-        - name: Run Snyk to check for vulnerabilities
-          uses: snyk/actions/node@master
-          continue-on-error: false # To make workflow fail when vuln detected
-          env:
-            SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          with:
-            command: code test
-
-
-    semgrep:
-      name: Semgrep Scan
-      runs-on: ubuntu-latest
-      permissions:
-        contents: read
-        actions: read
-      if: (github.actor != 'dependabot[bot]')
-      steps:
-        - uses: actions/checkout@v4
-        - name: Install Semgrep
-          run: pipx install semgrep
-    
-        - name: Run Semgrep (fail on findings)
-          run: semgrep --config=auto --severity ERROR --severity WARNING .
-                
 
     sonarqube:
           name: SonarQube
@@ -94,10 +54,80 @@ jobs:
                 fi     
 
 
+    snyk:
+      name: Snyk Scan
+      runs-on: ubuntu-latest
+    
+      steps:
+        - uses: actions/checkout@v4
+    
+        - name: Install Snyk
+          run: npm install -g snyk
+    
+        - name: Run Snyk (human-readable JSON)
+          env:
+            SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          run: |
+            snyk code test --json > snyk-report.json || true
+    
+        - name: Run Snyk (SARIF for GitHub Security)
+          env:
+            SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          run: |
+            snyk code test --sarif > snyk-report.sarif || true
+    
+        - name: Upload Snyk reports
+          if: always()
+          uses: actions/upload-artifact@v4
+          with:
+            name: snyk-report
+            path: |
+              snyk-report.json
+              snyk-report.sarif
+    
+        - name: Fail if Snyk Code findings exist
+          run: |
+            if jq -e '.runs[0].results | length > 0' snyk-report.json > /dev/null; then
+              echo "❌ Snyk code vulnerabilities found"
+              exit 1
+            else
+              echo "✅ No Snyk code vulnerabilities"
+            fi
+
+
+
+    semgrep:
+      name: Semgrep Scan
+      runs-on: ubuntu-latest
+      if: github.actor != 'dependabot[bot]'
+
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Install Semgrep
+          run: pipx install semgrep
+
+        - name: Run Semgrep
+          run: |
+            semgrep --config=auto --json > semgrep-report.json || true
+
+        - uses: actions/upload-artifact@v4
+          if: always()
+          with:
+            name: semgrep-report
+            path: semgrep-report.json
+
+        - name: Fail if Semgrep findings exist
+          run: |
+            if [ "$(jq '.results | length' semgrep-report.json)" -gt 0 ]; then
+              exit 1
+            fi
+
+
 
     create_issue:
       name: Create / Update Security Issue
-      needs: [snyk,semgrep,sonarqube]
+      needs: [snyk, semgrep]
       runs-on: ubuntu-latest
       if: always()
     
@@ -106,84 +136,157 @@ jobs:
         issues: write
     
       steps:
+        - name: Download scan reports
+          uses: actions/download-artifact@v4
+          with:
+            path: reports
+    
         - name: Create / Update GitHub Issue
           uses: actions/github-script@v7
           with:
             github-token: ${{ secrets.GITHUB_TOKEN }}
             script: |
-                const owner = context.repo.owner;
-                const repo = context.repo.repo;
-                const label = "security:sast";
-                const title = "🚨 SAST Vulnerabilities Detected";
-                
-                const snykResult = "${{ needs.snyk.result }}";
-                const semgrepResult = "${{ needs.semgrep.result }}";
-                const sonarqubeResult = "${{ needs.sonarqube.result }}";
-                const hasFailures =
-                  snykResult === "failure" || semgrepResult === "failure" || sonarqubeResult === "failure";
-                  
-                
-                const issues = await github.rest.issues.listForRepo({
+              const fs = require("fs");
+    
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              const title = "🚨 SAST Vulnerabilities Detected";
+              const label = "security:sast";
+    
+              /* ---------- HELPERS ---------- */
+    
+              const readJSON = (path) => {
+                if (!fs.existsSync(path)) return null;
+                try {
+                  return JSON.parse(fs.readFileSync(path, "utf8"));
+                } catch {
+                  return null;
+                }
+              };
+    
+              /* ---------- SNYK PARSER ---------- */
+              const parseSnyk = (path) => {
+                const data = readJSON(path);
+                const results = data?.runs?.[0]?.results;
+    
+                if (!results || results.length === 0) {
+                  return "_No Snyk findings_";
+                }
+    
+                return results.map((r, i) => {
+                  const loc = r.locations?.[0]?.physicalLocation;
+                  const file = loc?.artifactLocation?.uri || "unknown";
+                  const line = loc?.region?.startLine || "?";
+    
+                  return `
+              ### ${i + 1}. ${r.ruleId || "Unknown Rule"}
+              - **Severity:** ${r.level || "unknown"}
+              - **Message:** ${r.message?.text || "N/A"}
+              - **File:** ${file}:${line}
+              `;
+                          }).join("\n");
+                        };
+    
+              /* ---------- SEMGREP PARSER ---------- */
+              const parseSemgrep = (path) => {
+                const data = readJSON(path);
+    
+                if (!data || !data.results || data.results.length === 0) {
+                  return "_No Semgrep findings_";
+                }
+    
+                return data.results.map((r, i) => `
+                ### ${i + 1}. ${r.check_id}
+                - **Severity:** ${r.extra?.severity || "unknown"}
+                - **Message:** ${r.extra?.message || "N/A"}
+                - **File:** ${r.path}:${r.start?.line}
+                `).join("\n");
+                          };
+    
+              /* ---------- READ REPORTS ---------- */
+    
+              const snykFindings = parseSnyk(
+                "reports/snyk-report/snyk-report.json"
+              );
+    
+              const semgrepFindings = parseSemgrep(
+                "reports/semgrep-report/semgrep-report.json"
+              );
+    
+              /* ---------- JOB STATUS ---------- */
+    
+              const snykFailed = "${{ needs.snyk.result }}" === "failure";
+              const semgrepFailed = "${{ needs.semgrep.result }}" === "failure";
+              const hasFailures = snykFailed || semgrepFailed;
+    
+              /* ---------- FIND EXISTING ISSUE ---------- */
+    
+              const issues = await github.rest.issues.listForRepo({
+                owner,
+                repo,
+                state: "open",
+                labels: label,
+              });
+    
+              const existing = issues.data.find(i => i.title === title);
+    
+              /* ---------- CLOSE ISSUE IF CLEAN ---------- */
+    
+              if (!hasFailures && existing) {
+                await github.rest.issues.update({
                   owner,
                   repo,
-                  state: "open",
-                  labels: label,
+                  issue_number: existing.number,
+                  state: "closed",
+                  body: "✅ No SAST vulnerabilities detected. Issue auto-closed.",
                 });
+                return;
+              }
+    
+              /* ---------- CREATE / UPDATE ISSUE ---------- */
+    
+              if (hasFailures) {
+                const body = `
+                ## 🚨 SAST Vulnerabilities Detected
                 
-                const existingIssue = issues.data.find(i => i.title === title);
-                
-                if (!hasFailures && existingIssue) {
-                  await github.rest.issues.update({
-                    owner,
-                    repo,
-                    issue_number: existingIssue.number,
-                    state: "closed",
-                  });
-                
-                  await github.rest.issues.createComment({
-                    owner,
-                    repo,
-                    issue_number: existingIssue.number,
-                    body: "✅ No SAST vulnerabilities detected. Closing issue automatically.",
-                  });
-                
-                  return;
-                }
-                
-                if (hasFailures) {
-                  const body = `
-                ### 🚨 SAST Vulnerabilities Detected
-                
-                **Workflow:** ${context.workflow}
-                **Branch:** ${context.ref}
+                **Workflow:** ${context.workflow}  
+                **Branch:** ${context.ref}  
                 **Commit:** ${context.sha}
                 
-                ### Scan Results
-                - **Snyk:** ${snykResult}
-                - **Semgrep:** ${semgrepResult}
-                - **SonarQube:** ${sonarqubeResult}
+                ---
+                
+                ## 🔍 Snyk Findings
+                ${snykFindings}
+                
+                ---
+                
+                ## 🔍 Semgrep Findings
+                ${semgrepFindings}
+                
+                ---
                 
                 🔗 https://github.com/${owner}/${repo}/actions/runs/${context.runId}
                 
-                ⛔ This issue will auto-close when vulnerabilities are fixed.
+                ⛔ This issue auto-updates and closes when vulnerabilities are fixed.
                 `;
-                
-                  if (existingIssue) {
-                    await github.rest.issues.createComment({
-                      owner,
-                      repo,
-                      issue_number: existingIssue.number,
-                      body,
-                    });
-                  } else {
-                    await github.rest.issues.create({
-                      owner,
-                      repo,
-                      title,
-                      body,
-                      labels: [label],
-                    });
-                  }
-                
-                  core.setFailed("SAST vulnerabilities detected");
+    
+                if (existing) {
+                  await github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number: existing.number,
+                    body,
+                    state: "open",
+                  });
+                } else {
+                  await github.rest.issues.create({
+                    owner,
+                    repo,
+                    title,
+                    body,
+                    labels: [label],
+                  });
                 }
+    
+                core.setFailed("SAST vulnerabilities detected");
+              }
